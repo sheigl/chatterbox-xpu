@@ -14,6 +14,7 @@ from .models.s3gen import S3GEN_SR, S3Gen
 from .models.tokenizers import EnTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
+from .devices import is_device_available
 
 
 REPO_ID = "ResembleAI/chatterbox"
@@ -130,7 +131,7 @@ class ChatterboxTTS:
         ckpt_dir = Path(ckpt_dir)
 
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
-        if device in ["cpu", "mps"]:
+        if str(device).split(":")[0] in ["cpu", "mps", "xpu"]:
             map_location = torch.device('cpu')
         else:
             map_location = None
@@ -172,6 +173,11 @@ class ChatterboxTTS:
                 print("MPS not available because the current PyTorch install was not built with MPS enabled.")
             else:
                 print("MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine.")
+            device = "cpu"
+
+        # Check if XPU (Intel GPU) is available
+        if str(device).split(":")[0] == "xpu" and not is_device_available(device):
+            print("XPU not available because the current PyTorch install was not built with XPU enabled or no Intel GPU was found.")
             device = "cpu"
 
         for fpath in ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json", "conds.pt"]:
@@ -234,8 +240,9 @@ class ChatterboxTTS:
         text = punc_norm(text)
         text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
 
-        if cfg_weight > 0.0:
-            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
+        # T3 inference always expects a batch of 2 (cond/uncond rows for CFG),
+        # so duplicate regardless of cfg_weight (matches mtl_tts.py behavior).
+        text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
 
         sot = self.t3.hp.start_text_token
         eot = self.t3.hp.stop_text_token

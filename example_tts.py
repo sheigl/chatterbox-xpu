@@ -1,16 +1,11 @@
 import torchaudio as ta
-import torch
 from pathlib import Path
 from chatterbox.tts import ChatterboxTTS
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+from chatterbox.devices import get_best_device
 
-# Automatically detect the best available device
-if torch.cuda.is_available():
-    device = "cuda"
-elif torch.backends.mps.is_available():
-    device = "mps"
-else:
-    device = "cpu"
+# Automatically detect the best available device (cuda > xpu > mps > cpu)
+device = get_best_device()
 
 print(f"Using device: {device}")
 

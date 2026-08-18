@@ -3,10 +3,14 @@ import os
 import numpy as np
 import torch
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
+from chatterbox.devices import get_best_device, is_device_available
+from chatterbox.voices import list_voices, resolve_voice, voice_path, voices_dir, refresh_voices
+from chatterbox.worker import run
 import gradio as gr
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = get_best_device()
 T3_MODEL = os.getenv("CHATTERBOX_MULTILINGUAL_T3_MODEL", "v2")
+VOICES_DIR = voices_dir()
 print(f"🚀 Running on device: {DEVICE}")
 print(f"Using multilingual T3 model: {T3_MODEL}")
 
@@ -143,9 +147,9 @@ def get_or_load_model():
     if MODEL is None:
         print("Model not loaded, initializing...")
         try:
-            MODEL = ChatterboxMultilingualTTS.from_pretrained(DEVICE, t3_model=T3_MODEL)
+            MODEL = run(lambda: ChatterboxMultilingualTTS.from_pretrained(DEVICE, t3_model=T3_MODEL))
             if hasattr(MODEL, 'to') and str(MODEL.device) != DEVICE:
-                MODEL.to(DEVICE)
+                MODEL = run(lambda: MODEL.to(DEVICE))
             print(f"Model loaded successfully. Internal device: {getattr(MODEL, 'device', 'N/A')}")
         except Exception as e:
             print(f"Error loading model: {e}")
@@ -164,6 +168,9 @@ def set_seed(seed: int):
     if DEVICE == "cuda":
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+    elif str(DEVICE).split(":")[0] == "xpu" and is_device_available("xpu"):
+        torch.xpu.manual_seed(seed)
+        torch.xpu.manual_seed_all(seed)
     random.seed(seed)
     np.random.seed(seed)
     
@@ -181,6 +188,7 @@ def resolve_audio_prompt(language_id: str, provided_path: str | None) -> str | N
 def generate_tts_audio(
     text_input: str,
     language_id: str,
+    voice_name: str = None,
     audio_prompt_path_input: str = None,
     exaggeration_input: float = 0.5,
     temperature_input: float = 0.8,
@@ -198,6 +206,7 @@ def generate_tts_audio(
     Args:
         text_input (str): The text to synthesize into speech (maximum 300 characters)
         language_id (str): The language code for synthesis (eg. en, fr, de, es, it, pt, hi)
+        voice_name (str, optional): Name of a voice from the voice library folder. Takes precedence over uploaded audio. Defaults to None.
         audio_prompt_path_input (str, optional): File path or URL to the reference audio file that defines the target voice style. Defaults to None.
         exaggeration_input (float, optional): Controls speech expressiveness (0.25-2.0, neutral=0.5, extreme values may be unstable). Defaults to 0.5.
         temperature_input (float, optional): Controls randomness in generation (0.05-5.0, higher=more varied). Defaults to 0.8.
@@ -218,7 +227,10 @@ def generate_tts_audio(
     print(f"Generating audio for text: '{text_input[:50]}...'")
     
     # Handle optional audio prompt
-    chosen_prompt = audio_prompt_path_input or default_audio_for_ui(language_id)
+    if voice_name:
+        chosen_prompt = resolve_voice(voice_name) or audio_prompt_path_input or default_audio_for_ui(language_id)
+    else:
+        chosen_prompt = audio_prompt_path_input or default_audio_for_ui(language_id)
 
     generate_kwargs = {
         "exaggeration": exaggeration_input,
@@ -231,11 +243,11 @@ def generate_tts_audio(
     else:
         print("No audio prompt provided; using default voice.")
         
-    wav = current_model.generate(
+    wav = run(lambda: current_model.generate(
         text_input[:300],  # Truncate text to max chars
         language_id=language_id,
         **generate_kwargs
-    )
+    ))
     print("Audio generation complete.")
     return (current_model.sr, wav.squeeze(0).numpy())
 
@@ -271,6 +283,16 @@ with gr.Blocks() as demo:
                 label="Reference Audio File (Optional)",
                 value=default_audio_for_ui(initial_lang)
             )
+
+            with gr.Row():
+                voice_lib = gr.Dropdown(
+                    choices=list_voices(),
+                    label="Voice library",
+                    info=f"Voices from {VOICES_DIR} — drop audio files there, then click Refresh.",
+                    value=None,
+                )
+                refresh_btn = gr.Button("↻ Refresh voice library")
+            refresh_btn.click(fn=refresh_voices, inputs=[], outputs=voice_lib)
             
             gr.Markdown(
                 "💡 **Note**: Ensure that the reference clip matches the specified language tag. Otherwise, language transfer outputs may inherit the accent of the reference clip's language. To mitigate this, set the CFG weight to 0.",
@@ -308,6 +330,7 @@ with gr.Blocks() as demo:
         inputs=[
             text,
             language_id,
+            voice_lib,
             ref_wav,
             exaggeration,
             temp,

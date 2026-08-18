@@ -3,32 +3,43 @@ import numpy as np
 import torch
 import gradio as gr
 from chatterbox.tts import ChatterboxTTS
+from chatterbox.devices import get_best_device, is_device_available
+from chatterbox.voices import list_voices, resolve_voice, voice_path, voices_dir, refresh_voices
+from chatterbox.worker import run
 
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = get_best_device()
+VOICES_DIR = voices_dir()
 
 
 def set_seed(seed: int):
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if DEVICE == "cuda":
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    elif str(DEVICE).split(":")[0] == "xpu" and is_device_available("xpu"):
+        torch.xpu.manual_seed(seed)
+        torch.xpu.manual_seed_all(seed)
     random.seed(seed)
     np.random.seed(seed)
 
 
 def load_model():
-    model = ChatterboxTTS.from_pretrained(DEVICE)
+    model = run(lambda: ChatterboxTTS.from_pretrained(DEVICE))
     return model
 
 
-def generate(model, text, audio_prompt_path, exaggeration, temperature, seed_num, cfgw, min_p, top_p, repetition_penalty):
+def generate(model, text, voice_name, audio_prompt_path, exaggeration, temperature, seed_num, cfgw, min_p, top_p, repetition_penalty):
     if model is None:
-        model = ChatterboxTTS.from_pretrained(DEVICE)
+        model = run(lambda: ChatterboxTTS.from_pretrained(DEVICE))
 
     if seed_num != 0:
         set_seed(int(seed_num))
 
-    wav = model.generate(
+    if voice_name:
+        audio_prompt_path = resolve_voice(voice_name) or audio_prompt_path
+
+    wav = run(lambda: model.generate(
         text,
         audio_prompt_path=audio_prompt_path,
         exaggeration=exaggeration,
@@ -37,7 +48,7 @@ def generate(model, text, audio_prompt_path, exaggeration, temperature, seed_num
         min_p=min_p,
         top_p=top_p,
         repetition_penalty=repetition_penalty,
-    )
+    ))
     return (model.sr, wav.squeeze(0).numpy())
 
 
@@ -52,6 +63,15 @@ with gr.Blocks() as demo:
                 max_lines=5
             )
             ref_wav = gr.Audio(sources=["upload", "microphone"], type="filepath", label="Reference Audio File", value=None)
+            with gr.Row():
+                voice_lib = gr.Dropdown(
+                    choices=list_voices(),
+                    label="Voice library",
+                    info=f"Voices from {VOICES_DIR} — drop audio files there, then click Refresh.",
+                    value=None,
+                )
+                refresh_btn = gr.Button("↻ Refresh voice library")
+            refresh_btn.click(fn=refresh_voices, inputs=[], outputs=voice_lib)
             exaggeration = gr.Slider(0.25, 2, step=.05, label="Exaggeration (Neutral = 0.5, extreme values can be unstable)", value=.5)
             cfg_weight = gr.Slider(0.0, 1, step=.05, label="CFG/Pace", value=0.5)
 
@@ -74,6 +94,7 @@ with gr.Blocks() as demo:
         inputs=[
             model_state,
             text,
+            voice_lib,
             ref_wav,
             exaggeration,
             temp,

@@ -3,8 +3,12 @@ import numpy as np
 import torch
 import gradio as gr
 from chatterbox.tts_turbo import ChatterboxTurboTTS
+from chatterbox.devices import get_best_device, is_device_available
+from chatterbox.voices import list_voices, resolve_voice, voice_path, voices_dir, refresh_voices
+from chatterbox.worker import run
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = get_best_device()
+VOICES_DIR = voices_dir()
 
 EVENT_TAGS = [
     "[clear throat]", "[sigh]", "[shush]", "[cough]", "[groan]",
@@ -68,21 +72,26 @@ INSERT_TAG_JS = """
 
 def set_seed(seed: int):
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if DEVICE == "cuda":
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    elif str(DEVICE).split(":")[0] == "xpu" and is_device_available("xpu"):
+        torch.xpu.manual_seed(seed)
+        torch.xpu.manual_seed_all(seed)
     random.seed(seed)
     np.random.seed(seed)
 
 
 def load_model():
     print(f"Loading Chatterbox-Turbo on {DEVICE}...")
-    model = ChatterboxTurboTTS.from_pretrained(DEVICE)
+    model = run(lambda: ChatterboxTurboTTS.from_pretrained(DEVICE))
     return model
 
 
 def generate(
         model,
         text,
+        voice_name,
         audio_prompt_path,
         temperature,
         seed_num,
@@ -93,12 +102,15 @@ def generate(
         norm_loudness
 ):
     if model is None:
-        model = ChatterboxTurboTTS.from_pretrained(DEVICE)
+        model = run(lambda: ChatterboxTurboTTS.from_pretrained(DEVICE))
 
     if seed_num != 0:
         set_seed(int(seed_num))
 
-    wav = model.generate(
+    if voice_name:
+        audio_prompt_path = resolve_voice(voice_name) or audio_prompt_path
+
+    wav = run(lambda: model.generate(
         text,
         audio_prompt_path=audio_prompt_path,
         temperature=temperature,
@@ -107,7 +119,7 @@ def generate(
         top_k=int(top_k),
         repetition_penalty=repetition_penalty,
         norm_loudness=norm_loudness,
-    )
+    ))
     return (model.sr, wav.squeeze(0).numpy())
 
 
@@ -146,6 +158,16 @@ with gr.Blocks(title="Chatterbox Turbo", css=CUSTOM_CSS) as demo:
                 value="https://storage.googleapis.com/chatterbox-demo-samples/prompts/female_random_podcast.wav"
             )
 
+            with gr.Row():
+                voice_lib = gr.Dropdown(
+                    choices=list_voices(),
+                    label="Voice library",
+                    info=f"Voices from {VOICES_DIR} — drop audio files there, then click Refresh.",
+                    value=None,
+                )
+                refresh_btn = gr.Button("↻ Refresh voice library")
+            refresh_btn.click(fn=refresh_voices, inputs=[], outputs=voice_lib)
+
             run_btn = gr.Button("Generate ⚡", variant="primary")
 
         with gr.Column():
@@ -167,6 +189,7 @@ with gr.Blocks(title="Chatterbox Turbo", css=CUSTOM_CSS) as demo:
         inputs=[
             model_state,
             text,
+            voice_lib,
             ref_wav,
             temp,
             seed_num,

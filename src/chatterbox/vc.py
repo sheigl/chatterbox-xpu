@@ -1,4 +1,5 @@
 from pathlib import Path
+import threading
 
 import librosa
 import torch
@@ -8,9 +9,34 @@ from safetensors.torch import load_file
 
 from .models.s3tokenizer import S3_SR
 from .models.s3gen import S3GEN_SR, S3Gen
+from .devices import is_device_available
 
 
 REPO_ID = "ResembleAI/chatterbox"
+
+
+# Cache of embedded target voices keyed by (absolute path, mtime), so reusing
+# the same voice across conversions skips the ~3.5s re-embedding step.
+_ref_voice_cache: dict[tuple[str, float], dict] = {}
+_ref_voice_lock = threading.Lock()
+
+
+def _cache_key(wav_fpath: str):
+    p = Path(wav_fpath).resolve()
+    try:
+        return str(p), p.stat().st_mtime_ns
+    except OSError:
+        return str(p), -1
+
+
+def _get_cached_ref_voice(wav_fpath: str):
+    with _ref_voice_lock:
+        return _ref_voice_cache.get(_cache_key(wav_fpath))
+
+
+def _cache_ref_voice(wav_fpath: str, ref_dict: dict):
+    with _ref_voice_lock:
+        _ref_voice_cache[_cache_key(wav_fpath)] = ref_dict
 
 
 class ChatterboxVC:
@@ -40,7 +66,7 @@ class ChatterboxVC:
         ckpt_dir = Path(ckpt_dir)
         
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
-        if device in ["cpu", "mps"]:
+        if str(device).split(":")[0] in ["cpu", "mps", "xpu"]:
             map_location = torch.device('cpu')
         else:
             map_location = None
@@ -68,17 +94,31 @@ class ChatterboxVC:
                 print("MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine.")
             device = "cpu"
             
+        # Check if XPU (Intel GPU) is available
+        if str(device).split(":")[0] == "xpu" and not is_device_available(device):
+            print("XPU not available because the current PyTorch install was not built with XPU enabled or no Intel GPU was found.")
+            device = "cpu"
+
         for fpath in ["s3gen.safetensors", "conds.pt"]:
             local_path = hf_hub_download(repo_id=REPO_ID, filename=fpath)
 
         return cls.from_local(Path(local_path).parent, device)
 
     def set_target_voice(self, wav_fpath):
+        cached = _get_cached_ref_voice(wav_fpath)
+        if cached is not None:
+            self.ref_dict = {
+                k: v.to(self.device) if torch.is_tensor(v) else v
+                for k, v in cached.items()
+            }
+            return
+
         ## Load reference wav
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
 
         s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
         self.ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
+        _cache_ref_voice(wav_fpath, self.ref_dict)
 
     def generate(
         self,

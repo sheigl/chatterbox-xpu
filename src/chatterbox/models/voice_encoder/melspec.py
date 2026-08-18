@@ -45,10 +45,10 @@ def melspectrogram(wav, hp, pad=True):
 
     # Normalise the mel from db to 0,1
     if hp.normalized_mels:
-        mel = _normalize(mel, hp).astype(np.float32)
+        mel = _normalize(mel, hp)
 
     assert not pad or mel.shape[1] == 1 + len(wav) // hp.hop_size   # Sanity check
-    return mel   # (M, T)
+    return mel.astype(np.float32)   # (M, T)
 
 
 def _stft(y, hp, pad=True):

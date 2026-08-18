@@ -20,6 +20,7 @@ from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
 from .models.t3.modules.t3_config import T3Config
 from .models.s3gen.const import S3GEN_SIL
+from .devices import is_device_available
 import logging
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,7 @@ class ChatterboxTurboTTS:
         ckpt_dir = Path(ckpt_dir)
 
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
-        if device in ["cpu", "mps"]:
+        if str(device).split(":")[0] in ["cpu", "mps", "xpu"]:
             map_location = torch.device('cpu')
         else:
             map_location = None
@@ -196,6 +197,11 @@ class ChatterboxTurboTTS:
                 print("MPS not available because the current PyTorch install was not built with MPS enabled.")
             else:
                 print("MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine.")
+            device = "cpu"
+
+        # Check if XPU (Intel GPU) is available
+        if str(device).split(":")[0] == "xpu" and not is_device_available(device):
+            print("XPU not available because the current PyTorch install was not built with XPU enabled or no Intel GPU was found.")
             device = "cpu"
 
         download_kwargs = dict(

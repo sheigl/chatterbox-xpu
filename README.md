@@ -63,6 +63,26 @@ pip install -e .
 ```
 We developed and tested Chatterbox on Python 3.11 on Debian 11 OS; the versions of the dependencies are pinned in `pyproject.toml` to ensure consistency. You can modify the code or dependencies in this installation mode.
 
+### Intel GPU (XPU) support
+
+Chatterbox runs on Intel Arc / integrated GPUs via PyTorch's XPU builds. Install the XPU build of PyTorch, then use `device="xpu"` (or a specific GPU, e.g. `device="xpu:1"`):
+
+```shell
+# From the repo root, after cloning (using uv):
+uv venv --python 3.13 .venv
+uv pip install --python .venv/bin/python -e . \
+  --overrides uv-overrides-xpu.txt \
+  --extra-index-url https://download.pytorch.org/whl/xpu
+```
+
+The `uv-overrides-xpu.txt` override file pins `torch==2.13.0+xpu` / `torchaudio==2.11.0+xpu`, and `torchcodec==0.16.0+cpu` must be installed from the same index so WAV saving works on XPU-only machines:
+
+```shell
+uv pip install --python .venv/bin/python "torchcodec==0.16.0+cpu" --index-url https://download.pytorch.org/whl/xpu
+```
+
+`get_best_device()` (exported from the `chatterbox` package) auto-selects CUDA, then the XPU device with the most memory, then MPS, then CPU. Larger models like Turbo/Nano may exceed 12 GB cards; use the device with the most VRAM (e.g. `device="xpu:1"` for a 32 GB GPU).
+
 ## Usage
 
 ##### Chatterbox-Turbo
@@ -113,7 +133,7 @@ import torchaudio as ta
 from chatterbox.tts import ChatterboxTTS
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
-device = "cuda"  # or "cpu" / "mps"
+device = "cuda"  # or "cpu" / "mps" / "xpu" (Intel GPU)
 
 # English example
 model = ChatterboxTTS.from_pretrained(device=device)
@@ -213,6 +233,51 @@ Evaluation reports:
 - [Chatterbox Turbo vs VibeVoice 7B](https://podonos.com/resembleai/chatterbox-turbo-vs-vibevoice7b)
 
 These evaluations were conducted under identical conditions and are publicly accessible via Podonos.
+
+## OpenAI-compatible API with a voice library
+
+Drop voice samples into the `./voices` folder (`.wav`, `.mp3`, `.flac`, …) and
+they become selectable voices on the OpenAI-compatible speech endpoint — pass the
+file's stem as the `voice` parameter and it is used as the cloned-voice reference.
+
+```shell
+# Example: clone the voice in voices/am_welch.wav
+cp /path/to/am_welch.wav voices/
+
+# Start the server (port 8040 to avoid conflicts with other services)
+.venv/bin/uvicorn openai_server:app --host 0.0.0.0 --port 8040
+```
+
+```shell
+curl -X POST http://localhost:8040/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model":"chatterbox","input":"Hello from the cloned voice.","voice":"am_welch","response_format":"wav"}' \
+  -o out.wav
+```
+
+Endpoints:
+
+| Endpoint | Description |
+|---|---|
+| `GET /v1/models` | List available models (`chatterbox`, `chatterbox-turbo`, `chatterbox-nano`, `chatterbox-multilingual`, `chatterbox-vc`) |
+| `GET /v1/voices` | List voices available in `./voices` |
+| `POST /v1/audio/speech` | OpenAI-compatible TTS. Fields: `model`, `input`, `voice`, `response_format`, `speed` (+ `language_id` for multilingual) |
+| `POST /v1/audio/voice-conversion` | Multipart: `file` (source audio) + `target_voice` (voice name from `./voices`) |
+
+Quality defaults (chosen for the best audio quality):
+- **Model**: the full (non-turbo) English `chatterbox` model by default.
+- **WAV/FLAC**: lossless, native 24 kHz.
+- **MP3**: upsampled to 48 kHz and encoded at 320 kbps CBR via ffmpeg (24 kHz is
+  MPEG-2, capped at 160 kbps, so upsampling is required for full quality).
+- **Voice references** prefer lossless files (`.wav`/`.flac`) when a stem has
+  multiple formats.
+- For the best voice clone, use **6–15 seconds** of clean, single-speaker speech
+  (Turbo/Nano hard-require >5 seconds).
+
+> **Note for Intel XPU:** all model work is serialized on a single worker thread.
+> The Intel level-zero runtime exhausts resources when a model is used across
+> multiple OS threads (visible as `UR_RESULT_ERROR_OUT_OF_RESOURCES`), so the
+> server deliberately runs every load and generation on one dedicated thread.
 
 ## Acknowledgements
 - [Podonos](https://podonos.com) — for supporting reproducible subjective speech evaluation

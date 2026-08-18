@@ -61,16 +61,6 @@ class AttentionQKV(nn.Module):
         self.flash = flash
         self.dropout_rate = dropout_rate
         self.dropout = nn.Dropout(dropout_rate)
-        self.flash_config = self.setup_flash_config() if flash else None
-
-    def setup_flash_config(self):
-        # Setup flash attention configuration
-        flash_config = {
-            'enable_flash': True,
-            'enable_math': True,
-            'enable_mem_efficient': True
-        }
-        return flash_config
 
     def forward(self, q, k, v, mask=None):
         q, k, v = [self.split_heads(tensor) for tensor in [q, k, v]]
@@ -90,13 +80,14 @@ class AttentionQKV(nn.Module):
         return torch.einsum("bhts,bhls->bhlt", attn, v)
 
     def flash_attention(self, q, k, v, mask=None):
-        config = self.flash_config if self.flash_config else {}
-        with torch.backends.cuda.sdp_kernel(**config):
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=mask,
-                dropout_p=self.dropout_rate if self.training else 0.
-            )
+        # F.scaled_dot_product_attention selects the best backend per device
+        # (flash / mem-efficient / math), so no CUDA-specific sdp_kernel
+        # context manager is needed and this works on cuda/xpu/cpu.
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask,
+            dropout_p=self.dropout_rate if self.training else 0.,
+        )
         return out
 
     def split_heads(self, x):
