@@ -4,9 +4,13 @@ Drop voice samples into ``./voices`` (e.g. ``am_welch.wav`` or ``am_welch.mp3``)
 then pass ``"am_welch"`` as the OpenAI ``voice`` parameter. The server resolves
 the name to the file and uses it as the cloned-voice reference.
 
-Start::
+Start (device pool via CLI flags)::
 
-    .venv/bin/uvicorn openai_server:app --host 0.0.0.0 --port 8040
+    .venv/bin/python openai_server.py --host 0.0.0.0 --port 8040 --devices xpu:0,xpu:2
+
+Start (uvicorn CLI; device pool from env vars)::
+
+    CHATTERBOX_DEVICES=xpu:0,xpu:2 .venv/bin/uvicorn openai_server:app --host 0.0.0.0 --port 8040
 
 Examples::
 
@@ -22,19 +26,32 @@ Quality notes:
 - Voice references prefer lossless files (.wav/.flac) when multiple files share
   a stem.
 
-All model work runs on a single dedicated worker thread: the Intel level-zero
-XPU runtime exhausts resources when the same model is used across threads, so
-every load and generation is serialized through one thread.
+Parallelism:
+The Intel level-zero XPU runtime exhausts resources when the *same model
+instance* is used across threads (UR_RESULT_ERROR_OUT_OF_RESOURCES). Each
+device therefore gets its own dedicated worker thread and its own model
+replicas, and requests are scheduled to the least-busy device — so N devices
+give N-way parallel generation.
+
+Device pool (pin which XPUs the server may use):
+- CHATTERBOX_DEVICES="xpu:0,xpu:1,xpu:2"  -> exactly this pool (pinned).
+- Otherwise CHATTERBOX_DEVICE="xpu:2"     -> single device (legacy behavior).
+- Neither set                             -> the single best available device.
+
+Per-model device pinning (control where heavy models load):
+- CHATTERBOX_MODEL_DEVICES="chatterbox-multilingual=xpu:1,chatterbox-turbo=xpu:1,xpu:2"
+  Pinned models only load on the listed devices; unpinned models spread over
+  the whole pool. If a pinned model has no device in the pool, requests for it
+  fail with HTTP 503.
 """
 
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
-import librosa
-import numpy as np
 import torch
 import torchaudio as ta
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -42,24 +59,96 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from chatterbox import ChatterboxTTS
-from chatterbox.devices import get_best_device
+from chatterbox.devices import get_best_device, is_device_available
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 from chatterbox.tts_turbo import ChatterboxTurboTTS
 from chatterbox.vc import ChatterboxVC
 from chatterbox.voices import list_voices, resolve_voice, voices_dir
-from chatterbox.worker import run
+import chatterbox.worker as worker
+from chatterbox.worker import run_on
 
-DEVICE = get_best_device()
 
-# Model name -> (kind, loader, description)
+# ---------------------------------------------------------------------------
+# CLI flags (applied before the device pool is computed below).
+#
+# ``--devices`` / ``--model-devices`` set the corresponding env vars so the
+# same logic paths are used under any launcher. Precedence: CLI > CHATTERBOX_DEVICES
+# > CHATTERBOX_DEVICE > best available device. Under ``uvicorn openai_server:app``
+# these flags are absent and the env vars rule.
+# ---------------------------------------------------------------------------
+def _apply_cli_device_args() -> None:
+    import argparse
+
+    if {"-h", "--help"} & set(sys.argv[1:]):
+        return  # let main() show full help
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--devices", default=None)
+    parser.add_argument("--model-devices", default=None)
+    known, _ = parser.parse_known_args()
+    if known.devices:
+        os.environ["CHATTERBOX_DEVICES"] = known.devices
+    if known.model_devices:
+        os.environ["CHATTERBOX_MODEL_DEVICES"] = known.model_devices
+
+
+_apply_cli_device_args()
+
+
+# ---------------------------------------------------------------------------
+# Device pool and model pinning
+# ---------------------------------------------------------------------------
+def _device_pool() -> list[str]:
+    raw = os.getenv("CHATTERBOX_DEVICES") or os.getenv("CHATTERBOX_DEVICE")
+    if not raw:
+        return [get_best_device()]
+    pool: list[str] = []
+    for part in str(raw).split(","):
+        d = part.strip()
+        if d and d not in pool:
+            pool.append(d)
+    available = [d for d in pool if is_device_available(d)]
+    skipped = [d for d in pool if d not in available]
+    if skipped:
+        print(f"[openai_server] skipping unavailable devices: {skipped}")
+    if not available:
+        best = get_best_device()
+        print(f"[openai_server] no pool devices available, falling back to {best}")
+        return [best]
+    return available
+
+
+def _model_device_pins() -> dict[str, set[str]]:
+    """model name -> set of devices it is allowed to load on."""
+    pins: dict[str, set[str]] = {}
+    for part in str(os.getenv("CHATTERBOX_MODEL_DEVICES", "")).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            print(f"[openai_server] ignoring malformed CHATTERBOX_MODEL_DEVICES entry: {part!r}")
+            continue
+        name, devs = part.split("=", 1)
+        name = name.strip()
+        devs = {d.strip() for d in devs.split(",") if d.strip()}
+        if name in MODELS and devs:
+            pins[name] = devs
+    return pins
+
+
+DEVICES = _device_pool()
+print(f"[openai_server] device pool: {DEVICES}")
+
+
+# Model name -> (kind, loader(device), description)
 MODELS = {
-    "chatterbox": ("tts", lambda: ChatterboxTTS.from_pretrained(DEVICE), "Full English TTS (highest quality)"),
-    "chatterbox-tts": ("tts", lambda: ChatterboxTTS.from_pretrained(DEVICE), "Full English TTS (highest quality)"),
-    "chatterbox-turbo": ("turbo", lambda: ChatterboxTurboTTS.from_pretrained(DEVICE), "Turbo English TTS"),
-    "chatterbox-nano": ("turbo", lambda: ChatterboxTurboTTS.from_pretrained(DEVICE, nano=True), "Nano English TTS"),
-    "chatterbox-multilingual": ("mtl", lambda: ChatterboxMultilingualTTS.from_pretrained(DEVICE), "Multilingual TTS (23 languages)"),
-    "chatterbox-vc": ("vc", lambda: ChatterboxVC.from_pretrained(DEVICE), "Voice conversion"),
+    "chatterbox": ("tts", lambda dev: ChatterboxTTS.from_pretrained(dev), "Full English TTS (highest quality)"),
+    "chatterbox-tts": ("tts", lambda dev: ChatterboxTTS.from_pretrained(dev), "Full English TTS (highest quality)"),
+    "chatterbox-turbo": ("turbo", lambda dev: ChatterboxTurboTTS.from_pretrained(dev), "Turbo English TTS"),
+    "chatterbox-nano": ("turbo", lambda dev: ChatterboxTurboTTS.from_pretrained(dev, nano=True), "Nano English TTS"),
+    "chatterbox-multilingual": ("mtl", lambda dev: ChatterboxMultilingualTTS.from_pretrained(dev), "Multilingual TTS (23 languages)"),
+    "chatterbox-vc": ("vc", lambda dev: ChatterboxVC.from_pretrained(dev), "Voice conversion"),
 }
+MODEL_DEVICE_PINS = _model_device_pins()
 
 CONTENT_TYPES = {
     "wav": "audio/wav",
@@ -69,34 +158,61 @@ CONTENT_TYPES = {
 }
 VALID_FORMATS = set(CONTENT_TYPES)
 
+MAX_INPUT_CHARS = int(os.getenv("CHATTERBOX_MAX_INPUT_CHARS", "1000"))
+
 
 # ---------------------------------------------------------------------------
-# Model cache (accessed only from the single worker thread via run()).
+# Model cache: (device, model name) -> model. Accessed only from worker threads.
 # ---------------------------------------------------------------------------
-_models: dict[str, object] = {}
+_models: dict[tuple[str, str], object] = {}
 
 
-def _get_model(name: str):
-    """Load (on the worker thread) and return (kind, model)."""
+def _pick_device(model_name: str) -> str:
+    model_name = model_name or "chatterbox"
+    pool = DEVICES
+    if model_name in MODEL_DEVICE_PINS:
+        allowed = MODEL_DEVICE_PINS[model_name]
+        pool = [d for d in DEVICES if d in allowed]
+        if not pool:
+            raise HTTPException(
+                503,
+                f"model '{model_name}' is pinned to {sorted(allowed)} but none of those "
+                f"devices are in the pool {DEVICES}",
+            )
+    return min(pool, key=lambda d: worker.depth(d))
+
+
+def _get_model(name: str, device: str):
+    """Load (on the device's worker thread) and return (kind, model)."""
     name = name or "chatterbox"
     if name not in MODELS:
         raise HTTPException(404, f"Unknown model '{name}'. Available: {sorted(MODELS)}")
 
     kind, loader, _ = MODELS[name]
+    key = (device, name)
 
     def load():
-        if name not in _models:
-            _models[name] = loader()
-        return kind, _models[name]
+        if key not in _models:
+            model = loader(device)
+            # Voice-encoder LSTM is flaky on level-zero after repeated runs on B580
+            # (UR_RESULT_ERROR_OUT_OF_RESOURCES on the 2nd generation). It's tiny, so
+            # keep it on CPU and leave all GPU memory for the main model.
+            if str(device).split(":")[0] == "xpu" and hasattr(model, "ve"):
+                model.ve.to("cpu")
+            _models[key] = model
+        return kind, _models[key]
 
-    return run(load)
+    return run_on(device, load)
 
 
-def _run_generation(model_name, fn):
-    def run_job():
-        return fn(_models[model_name])
+def _run_generation(device: str, model_name: str, fn):
+    def job():
+        try:
+            return fn(_models[(device, model_name)])
+        finally:
+            _release_gpu_memory(device)
 
-    return run(run_job)
+    return run_on(device, job)
 
 
 # ---------------------------------------------------------------------------
@@ -164,12 +280,62 @@ def _apply_speed(wav: torch.Tensor, sr: int, speed: float) -> torch.Tensor:
         raise HTTPException(422, "speed must be in (0, 4]")
     if abs(speed - 1.0) < 1e-6:
         return wav
-    y = wav.detach().cpu().numpy()
-    if y.ndim == 1:
-        y = librosa.effects.time_stretch(y, rate=speed)  # pitch-preserving
-    else:
-        y = np.stack([librosa.effects.time_stretch(ch, rate=speed) for ch in y])
-    return torch.from_numpy(np.asarray(y, dtype=np.float32))
+
+    # High-quality time-stretch via ffmpeg's rubberband filter (WSOLA-based).
+    # librosa.effects.time_stretch uses a phase vocoder, which smears speech
+    # ("distant/echoey" artifacts) even at mild speeds like 0.9.
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise HTTPException(500, "ffmpeg is required for speed adjustment")
+
+    y = wav.detach().cpu().float()
+    if y.dim() == 1:
+        y = y.unsqueeze(0)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        in_path = tmp.name
+    out_path = in_path + ".spd.wav"
+    try:
+        ta.save(in_path, y, sr)
+        proc = subprocess.run(
+            [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", in_path,
+                "-af", f"rubberband=tempo={speed:.6f}",
+                "-ar", str(sr),
+                out_path,
+            ],
+            capture_output=True,
+        )
+        if proc.returncode != 0 or not os.path.exists(out_path):
+            raise HTTPException(
+                500,
+                f"ffmpeg rubberband failed: {proc.stderr.decode(errors='replace')}",
+            )
+        out_wav, out_sr = ta.load(out_path)
+    finally:
+        for p in (in_path, out_path):
+            if os.path.exists(p):
+                os.unlink(p)
+
+    return out_wav.squeeze(0) if out_wav.dim() > 1 else out_wav
+
+
+def _release_gpu_memory(device: str):
+    """Return cached freed blocks to the driver to avoid VRAM ratcheting.
+
+    The PyTorch level-zero caching allocator retains freed device (and host)
+    memory across requests, so VRAM creeps upward under sustained synthesis
+    until the vocoder fails to allocate (``could not create a primitive`` ->
+    HTTP 500). Calling ``empty_cache()`` after each request returns those
+    blocks to the driver. Must be called from that device's worker thread,
+    where it is the current device.
+    """
+    base = str(device).split(":")[0]
+    if base == "xpu":
+        torch.xpu.empty_cache()
+    elif base == "cuda":
+        torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -196,12 +362,27 @@ def root():
         "voices": "/v1/voices",
         "speech": "POST /v1/audio/speech",
         "voice_conversion": "POST /v1/audio/voice-conversion",
+        "devices": DEVICES,
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "device": DEVICE}
+    # Snapshot under a retry: workers may be inserting model replicas mid-request.
+    try:
+        loaded = list(_models)
+    except RuntimeError:
+        loaded = []
+    return {
+        "status": "ok",
+        "devices": {
+            d: {
+                "busy_jobs": worker.depth(d),
+                "loaded_models": [n for (dev, n) in loaded if dev == d],
+            }
+            for d in DEVICES
+        },
+    }
 
 
 @app.get("/v1/models")
@@ -222,22 +403,23 @@ def list_voices_endpoint():
 
 @app.post("/v1/audio/speech")
 def speech(req: SpeechRequest):
-    if len(req.input) > 300:
-        req.input = req.input[:300]
+    if len(req.input) > MAX_INPUT_CHARS:
+        raise HTTPException(413, f"input too long: {len(req.input)} chars > {MAX_INPUT_CHARS} max")
     if req.response_format not in VALID_FORMATS:
         raise HTTPException(422, f"response_format must be one of {sorted(VALID_FORMATS)}")
 
     ref_path = _resolve_voice_or_404(req.voice)
-    kind, _ = _get_model(req.model)
+    device = _pick_device(req.model)
+    kind, model = _get_model(req.model, device)
 
-    def generate(model):
+    def generate(m):
         if kind == "mtl":
             language = req.language_id or "en"
-            return model.generate(req.input, language, audio_prompt_path=ref_path)
-        return model.generate(req.input, audio_prompt_path=ref_path)
+            return m.generate(req.input, language, audio_prompt_path=ref_path)
+        return m.generate(req.input, audio_prompt_path=ref_path)
 
-    wav = _run_generation(req.model, generate)
-    sr = _get_model(req.model)[1].sr
+    wav = _run_generation(device, req.model or "chatterbox", generate)
+    sr = model.sr
 
     wav = _apply_speed(wav, sr, req.speed)
     data = _tensor_to_bytes(wav, sr, req.response_format)
@@ -245,7 +427,11 @@ def speech(req: SpeechRequest):
     return Response(
         content=data,
         media_type=CONTENT_TYPES[req.response_format],
-        headers={"X-Chatterbox-Model": req.model, "X-Chatterbox-Voice": req.voice or "default"},
+        headers={
+            "X-Chatterbox-Model": req.model,
+            "X-Chatterbox-Voice": req.voice or "default",
+            "X-Chatterbox-Device": device,
+        },
     )
 
 
@@ -265,19 +451,58 @@ async def voice_conversion(
         shutil.copyfileobj(file.file, tmp)
 
     try:
-        kind, _ = _get_model("chatterbox-vc")
+        device = _pick_device("chatterbox-vc")
+        kind, model = _get_model("chatterbox-vc", device)
 
-        def convert(model):
-            return model.generate(tmp_path, target_voice_path=ref_path)
+        def convert(m):
+            return m.generate(tmp_path, target_voice_path=ref_path)
 
-        wav = _run_generation("chatterbox-vc", convert)
+        wav = _run_generation(device, "chatterbox-vc", convert)
+        sr = model.sr
+        data = _tensor_to_bytes(wav, sr, response_format)
+        return Response(
+            content=data,
+            media_type=CONTENT_TYPES[response_format],
+            headers={
+                "X-Chatterbox-Model": "chatterbox-vc",
+                "X-Chatterbox-Voice": target_voice,
+                "X-Chatterbox-Device": device,
+            },
+        )
     finally:
-        os.unlink(tmp_path)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
-    sr = _get_model("chatterbox-vc")[1].sr
-    data = _tensor_to_bytes(wav, sr, response_format)
-    return Response(
-        content=data,
-        media_type=CONTENT_TYPES[response_format],
-        headers={"X-Chatterbox-Model": "chatterbox-vc", "X-Chatterbox-Voice": target_voice},
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+def main() -> None:
+    import argparse
+
+    import uvicorn
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Chatterbox OpenAI-compatible API server. Device pool precedence: "
+            "CLI --devices > CHATTERBOX_DEVICES > CHATTERBOX_DEVICE > best device."
+        ),
     )
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8040)
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help='comma-separated XPU pool, e.g. "xpu:0,xpu:2" (pins devices; overrides CHATTERBOX_DEVICES)',
+    )
+    parser.add_argument(
+        "--model-devices",
+        default=None,
+        help='pin models to devices, e.g. "chatterbox-multilingual=xpu:1" (overrides CHATTERBOX_MODEL_DEVICES)',
+    )
+    args = parser.parse_args()
+    uvicorn.run(app, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()
