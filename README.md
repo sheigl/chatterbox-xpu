@@ -65,21 +65,24 @@ We developed and tested Chatterbox on Python 3.11 on Debian 11 OS; the versions 
 
 ### Intel GPU (XPU) support
 
-Chatterbox runs on Intel Arc / integrated GPUs via PyTorch's XPU builds. Install the XPU build of PyTorch, then use `device="xpu"` (or a specific GPU, e.g. `device="xpu:1"`):
+Chatterbox runs on Intel Arc / integrated GPUs via PyTorch's XPU builds. The project is managed with [uv](https://docs.astral.sh/uv/): `pyproject.toml` selects the right torch build automatically, so `uv sync`/`uv run` work on any machine with no extra flags:
 
 ```shell
 # From the repo root, after cloning (using uv):
-uv venv --python 3.13 .venv
-uv pip install --python .venv/bin/python -e . \
-  --overrides uv-overrides-xpu.txt \
-  --extra-index-url https://download.pytorch.org/whl/xpu
+uv sync
 ```
 
-The `uv-overrides-xpu.txt` override file pins `torch==2.13.0+xpu` / `torchaudio==2.11.0+xpu`, and `torchcodec==0.16.0+cpu` must be installed from the same index so WAV saving works on XPU-only machines:
+On linux x86_64, `uv sync` installs the PyTorch XPU builds (`torch==2.13.0+xpu`, `torchaudio==2.11.0+xpu`, `torchcodec==0.16.0+cpu`) plus the Intel oneAPI runtimes from the PyTorch XPU index. On every other platform (macOS, Windows, ARM) it installs the standard PyPI builds, which run on CPU/CUDA/MPS.
+
+Start the OpenAI-compatible API server with:
 
 ```shell
-uv pip install --python .venv/bin/python "torchcodec==0.16.0+cpu" --index-url https://download.pytorch.org/whl/xpu
+uv run chatterbox-server --host 0.0.0.0 --port 8045 --devices xpu:0
+# or equivalently:
+uv run python openai_server.py --host 0.0.0.0 --port 8045 --devices xpu:0
 ```
+
+Then use `device="xpu"` (or a specific GPU, e.g. `device="xpu:1"`).
 
 `get_best_device()` (exported from the `chatterbox` package) auto-selects CUDA, then the XPU device with the most memory, then MPS, then CPU. Larger models like Turbo/Nano may exceed 12 GB cards; use the device with the most VRAM (e.g. `device="xpu:1"` for a 32 GB GPU).
 

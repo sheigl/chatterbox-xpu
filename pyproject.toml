@@ -14,11 +14,40 @@ dependencies = [
     "numpy>=2.0.0; python_version >= '3.13'",
     "librosa==0.11.0",
     "s3tokenizer",
-    # torch 2.6.0 supports Python 3.10-3.13; Python 3.14 needs 2.9.0+
-    "torch==2.6.0; python_version < '3.14'",
-    "torch>=2.9.0; python_version >= '3.14'",
-    "torchaudio==2.6.0; python_version < '3.14'",
-    "torchaudio>=2.9.0; python_version >= '3.14'",
+    # Intel Arc / integrated GPU (XPU) builds on linux x86_64;
+    # CPU/CUDA-capable PyPI builds everywhere else.
+    "torch==2.13.0+xpu; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torch==2.6.0; python_version < '3.14' and (sys_platform != 'linux' or platform_machine != 'x86_64')",
+    "torch>=2.9.0; python_version >= '3.14' and (sys_platform != 'linux' or platform_machine != 'x86_64')",
+    "torchaudio==2.11.0+xpu; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchaudio==2.6.0; python_version < '3.14' and (sys_platform != 'linux' or platform_machine != 'x86_64')",
+    "torchaudio>=2.9.0; python_version >= '3.14' and (sys_platform != 'linux' or platform_machine != 'x86_64')",
+    "torchcodec==0.16.0+cpu; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # Intel oneAPI runtime deps of the XPU torch build (XPU index only; declared
+    # here as direct deps because uv sources only apply to direct dependencies).
+    "dpcpp-cpp-rt==2026.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "impi-rt==2021.18.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "intel-cmplr-lib-rt==2026.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "intel-cmplr-lib-ur==2026.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "intel-cmplr-lic-rt==2026.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "intel-opencl-rt==2026.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "intel-openmp==2026.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "intel-pti==0.17.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "intel-sycl-rt==2026.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "mkl==2026.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "oneccl==2022.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "oneccl-devel==2022.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "onemkl-license==2026.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "onemkl-sycl-blas==2026.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "onemkl-sycl-dft==2026.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "onemkl-sycl-lapack==2026.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "onemkl-sycl-rng==2026.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "onemkl-sycl-sparse==2026.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "pyzes==0.1.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tbb==2023.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tcmlib==1.5.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "triton-xpu==3.7.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "umf==1.1.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "transformers==5.2.0",
     "diffusers==0.29.0",
     "resemble-perth @ git+https://github.com/resemble-ai/Perth.git@master",
@@ -31,6 +60,9 @@ dependencies = [
     "omegaconf"
 ]
 
+[project.scripts]
+chatterbox-server = "chatterbox.server:main"
+
 [project.urls]
 Homepage = "https://github.com/resemble-ai/chatterbox"
 Repository = "https://github.com/resemble-ai/chatterbox"
@@ -41,3 +73,40 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv]
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true
+
+[tool.uv.sources]
+# XPU builds and their Intel runtime deps only exist on the PyTorch XPU index,
+# which is linux x86_64-only. Everything else stays on PyPI, on every platform.
+torch = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+torchaudio = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+torchcodec = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+dpcpp-cpp-rt = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+impi-rt = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+intel-cmplr-lib-rt = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+intel-cmplr-lib-ur = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+intel-cmplr-lic-rt = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+intel-opencl-rt = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+intel-openmp = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+intel-pti = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+intel-sycl-rt = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+mkl = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+oneccl = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+oneccl-devel = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+onemkl-license = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+onemkl-sycl-blas = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+onemkl-sycl-dft = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+onemkl-sycl-lapack = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+onemkl-sycl-rng = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+onemkl-sycl-sparse = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+pyzes = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+tbb = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+tcmlib = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+triton-xpu = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+umf = [{ index = "pytorch-xpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
