@@ -158,7 +158,7 @@ CONTENT_TYPES = {
 }
 VALID_FORMATS = set(CONTENT_TYPES)
 
-MAX_INPUT_CHARS = int(os.getenv("CHATTERBOX_MAX_INPUT_CHARS", "1000"))
+MAX_INPUT_CHARS = int(os.getenv("CHATTERBOX_MAX_INPUT_CHARS", "10000"))
 
 
 # ---------------------------------------------------------------------------
